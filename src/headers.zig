@@ -91,8 +91,7 @@ pub fn unfold(raw: []u8) []u8 {
             w -= 1; // reopen the previous field: drop its '\n'
             std.mem.copyForwards(u8, raw[w..], raw[start..line_end]);
             w += line_end - start;
-            raw[w] = '\n';
-            w += 1;
+            w += terminate(raw, w);
             continue;
         }
         const colon = fieldColon(raw[start..line_end]) orelse {
@@ -108,11 +107,18 @@ pub fn unfold(raw: []u8) []u8 {
         const value_start = start + colon + 1;
         std.mem.copyForwards(u8, raw[w..], raw[value_start..line_end]);
         w += line_end - value_start;
-        raw[w] = '\n';
-        w += 1;
+        w += terminate(raw, w);
         in_field = true;
     }
     return raw[0..w];
+}
+
+/// Writes the '\n' ending a field, except after a final line that had no line break of its own
+/// (the block is full then, and the iterator does not need it).
+fn terminate(raw: []u8, w: usize) usize {
+    if (w == raw.len) return 0;
+    raw[w] = '\n';
+    return 1;
 }
 
 pub fn trimWs(s: []const u8) []const u8 {
@@ -375,6 +381,17 @@ test "unfold joins continuation lines and normalises line endings" {
     try testing.expectEqualStrings("a long  subject", h.get("subject").?);
     try testing.expectEqualStrings("x@y\tcontinued", h.get("FROM").?);
     try testing.expectEqual(@as(usize, 1), h.count("x-bare"));
+}
+
+test "unfold handles a final line without a line break" {
+    var raw = "A: 1\r\nB: 2".*;
+    const block = unfold(&raw);
+    try testing.expectEqualStrings("A: 1\nB: 2\n", block);
+    try testing.expectEqualStrings("2", (Headers{ .block = block }).get("b").?);
+    var full = "B:2".*;
+    try testing.expectEqualStrings("B:2", unfold(&full));
+    var cont = "A: 1\n 2".*;
+    try testing.expectEqualStrings("A: 1 2\n", unfold(&cont));
 }
 
 test "unfold drops orphan continuations and non-field lines" {

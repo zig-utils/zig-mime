@@ -690,3 +690,39 @@ test "a nested multipart reusing the outer boundary takes delimiters until it cl
         \\
     );
 }
+
+test "a delimiter right after a message/rfc822 part's headers begins and ends its empty message" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/digest; boundary=a
+        \\
+        \\--a
+        \\--a--
+    ), .{},
+        \\begin 0: multipart multipart/digest
+        \\begin 1:1 message message/rfc822
+        \\begin 2:1 leaf text/plain
+        \\end 2:1
+        \\end 1:1
+        \\end 0:
+        \\
+    );
+}
+
+test "a header block without its blank line ends at the first non-field line" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary=a
+        \\
+        \\--a
+        \\Content-Transfer-Encoding: base64
+        \\aGVsbG8=
+        \\--a--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\begin 1:1 leaf text/plain
+        \\diag missing_header_separator 1:1
+        \\body 1:1 content hello
+        \\end 1:1
+        \\end 0:
+        \\
+    );
+}

@@ -179,7 +179,9 @@ pub const DiagnosticKind = enum {
 
 pub const Diagnostic = struct {
     kind: DiagnosticKind,
-    /// The part the diagnostic is about; valid until that part's `part_end`.
+    /// The part the diagnostic is about; valid until that part's `part_end`. Header limit
+    /// diagnostics (`header_too_large`, `scratch_exhausted`, `header_line_too_long`) arrive while
+    /// the header block is read, before that part's `part_begin`; all others follow it.
     part: ?*const Part,
     /// Approximate stream offset where it was detected.
     offset: u64,
@@ -260,6 +262,8 @@ const Delim = struct {
 const DelimClass = union(enum) { not, need_more, delim: Delim };
 const HeaderLine = union(enum) { need_more, blank, field, continuation, other, mbox_from, delim: Delim };
 
+/// Events point into the walker (paths, boundaries, parts), so a walker must not be copied or
+/// moved once it has been fed.
 pub const Walker = struct {
     sink: Sink,
     scratch: []u8,
@@ -278,6 +282,8 @@ pub const Walker = struct {
     state: State = .start,
     after_skip: AfterSkip = .body,
     skip_garbage: bool = false,
+    /// The multipart whose delimiter line is being skipped.
+    skip_part: ?*const Part = null,
     scratch_top: usize = 0,
 
     // Header block being collected.
@@ -483,13 +489,12 @@ pub const Walker = struct {
                 }
             },
             .delim => |d| {
-                try self.endHeaders();
+                try self.endHeadersAtDelimiter();
                 try self.handleDelimiter(d);
                 try self.replay(line[@min(d.len, line.len)..]);
             },
             .other => {
-                try self.diag(.missing_header_separator, &self.top().part);
-                try self.endHeaders();
+                try self.endHeadersNoting(.missing_header_separator);
                 try self.replay(line);
             },
         }
@@ -504,8 +509,9 @@ pub const Walker = struct {
         switch (class) {
             .delim => |d| {
                 self.first_line = false;
-                try self.endHeaders();
+                try self.endHeadersAtDelimiter();
                 try self.handleDelimiter(d);
+                try self.replay(line[@min(d.len, n)..n]);
             },
             .field, .continuation => {
                 self.first_line = false;
@@ -543,6 +549,7 @@ pub const Walker = struct {
             .field => {
                 self.line_key = self.claimKeyField(bytes);
                 self.line_stored = true;
+                self.field_stored = true;
             },
             .continuation => self.line_stored = self.field_stored,
             .block => {
@@ -551,7 +558,6 @@ pub const Walker = struct {
             },
         }
         try self.appendStoredLine(bytes);
-        if (kind != .continuation) self.field_stored = self.line_stored;
     }
 
     /// True for the first occurrence of a field the walker interprets.
@@ -587,6 +593,8 @@ pub const Walker = struct {
         }
         self.hdr_len = self.line_start;
         self.line_stored = false;
+        // Later continuations must not attach to whatever field was stored before this one.
+        self.field_stored = false;
         if (!self.hdr_overflow) {
             self.hdr_overflow = true;
             const kind: DiagnosticKind = if (by_scratch < self.options.max_header_bytes) .scratch_exhausted else .header_too_large;
@@ -629,13 +637,26 @@ pub const Walker = struct {
         return if (line[i] == ':') .field else .other;
     }
 
+    /// Ends the header block because a delimiter arrived. An embedded message part begun here
+    /// gets its (empty) message begun too, so every part the delimiter closes has begun.
+    fn endHeadersAtDelimiter(self: *Walker) Sink.Error!void {
+        try self.endHeaders();
+        while (self.state == .header) try self.endHeaders();
+    }
+
     fn endHeaders(self: *Walker) Sink.Error!void {
+        return self.endHeadersNoting(null);
+    }
+
+    /// Ends the header block; `extra` is a diagnostic about how it ended, reported with the rest.
+    fn endHeadersNoting(self: *Walker, extra: ?DiagnosticKind) Sink.Error!void {
         const e = self.top();
         const block = headers.unfold(self.scratch[self.hdr_start..][0..self.hdr_len]);
         self.scratch_top = self.hdr_start + block.len;
         e.part.headers = .{ .block = block };
 
         var pending: Pending = .{};
+        if (extra) |k| pending.add(k);
 
         // Content-Type: the first field that parses, unless a later one is a multipart with a
         // boundary and the chosen one is not; then the multipart view wins, so its parts are
@@ -895,6 +916,7 @@ pub const Walker = struct {
     fn handleDelimiter(self: *Walker, d: Delim) Sink.Error!void {
         while (self.len - 1 > d.level) try self.endTop();
         const f = &self.stack[d.level];
+        self.skip_part = &f.part;
         self.skip_garbage = !d.exact;
         if (!d.exact) try self.diag(.boundary_suffix, &f.part);
         self.state = .skip_line;
@@ -923,7 +945,7 @@ pub const Walker = struct {
             for (seg) |c| {
                 if (c != ' ' and c != '\t' and c != '\r' and c != '\n') {
                     self.skip_garbage = true;
-                    try self.diag(.boundary_suffix, &self.top().part);
+                    try self.diag(.boundary_suffix, self.skip_part);
                     break;
                 }
             }
@@ -1019,7 +1041,12 @@ pub const Walker = struct {
                 self.at_line_start = false;
                 self.eol_len = 0;
                 try self.handleDelimiter(d);
-                return @max(d.len, old) - old;
+                if (d.len >= old) return d.len - old;
+                // The held line start runs past the delimiter: skip that part of it too.
+                var rest: [head_cap]u8 = undefined;
+                @memcpy(rest[0 .. old - d.len], self.head[d.len..old]);
+                _ = try self.stepSkip(rest[0 .. old - d.len]);
+                return 0;
             },
             .need_more => {
                 self.head_len = old + k;
@@ -1042,7 +1069,10 @@ pub const Walker = struct {
             switch (self.classifyDelimiter(self.head[0..n], true)) {
                 .delim => |d| {
                     self.eol_len = 0;
+                    var rest: [head_cap]u8 = undefined;
+                    @memcpy(rest[0 .. n - d.len], self.head[d.len..n]);
                     try self.handleDelimiter(d);
+                    _ = try self.stepSkip(rest[0 .. n - d.len]);
                     return true;
                 },
                 .not => {
