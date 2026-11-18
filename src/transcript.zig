@@ -1,6 +1,7 @@
 //! A sink that renders the event stream as text, one line per event, merging adjacent body
-//! events of the same part and region. The result does not depend on how the input was split
-//! into chunks, which is what the tests and the fuzzer compare. It allocates, so it is a
+//! events of the same part and region. Raw-view bytes of a part are collected and written just
+//! before its end line. The result does not depend on how the input was split into chunks,
+//! which is what the tests and the fuzzer compare. It allocates, so it is a
 //! debugging and testing aid, not something for the hot path.
 const std = @import("std");
 const walker = @import("walker.zig");
@@ -13,6 +14,8 @@ pub const Transcript = struct {
     out: std.ArrayList(u8) = .empty,
     /// Part index and region of the body line still open, if any.
     open_body: ?struct { index: u32, region: walker.Region } = null,
+    /// Raw-view bytes of the current leaf.
+    raw: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Transcript {
         return .{ .gpa = gpa };
@@ -20,6 +23,7 @@ pub const Transcript = struct {
 
     pub fn deinit(self: *Transcript) void {
         self.out.deinit(self.gpa);
+        self.raw.deinit(self.gpa);
     }
 
     pub fn sink(self: *Transcript) Sink {
@@ -40,6 +44,7 @@ pub const Transcript = struct {
         const w = self.gpa;
         switch (event) {
             .body => |b| {
+                if (b.raw) return self.raw.appendSlice(w, b.bytes);
                 if (self.open_body) |o| {
                     if (o.index == b.part.index and o.region == b.region) return self.escape(b.bytes);
                 }
@@ -59,8 +64,22 @@ pub const Transcript = struct {
             },
             .part_end => |e| {
                 try self.closeBody();
+                if (self.raw.items.len > 0) {
+                    try self.out.appendSlice(w, "raw ");
+                    try self.writePath(e.part);
+                    try self.out.append(w, ' ');
+                    try self.escape(self.raw.items);
+                    try self.out.append(w, '\n');
+                    self.raw.clearRetainingCapacity();
+                }
                 try self.out.appendSlice(w, "end ");
                 try self.writePath(e.part);
+                if (e.decode_flags.any()) {
+                    const f = e.decode_flags;
+                    if (f.invalid_input) try self.out.appendSlice(w, " invalid_input");
+                    if (f.padding_inside) try self.out.appendSlice(w, " padding_inside");
+                    if (f.truncated) try self.out.appendSlice(w, " truncated");
+                }
                 try self.out.append(w, '\n');
             },
             .diagnostic => |d| {

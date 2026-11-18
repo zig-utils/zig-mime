@@ -14,11 +14,12 @@
 const std = @import("std");
 const headers = @import("headers.zig");
 const scan = @import("scan.zig");
+const decode = @import("decode.zig");
 
 const Headers = headers.Headers;
 const ContentType = headers.ContentType;
 
-/// Deepest nesting the walker can track; `Limits.max_depth` is clamped to it.
+/// Deepest nesting the walker can track; `Options.max_depth` is clamped to it.
 pub const max_depth_cap = 32;
 /// Longest boundary the walker will split on. RFC 2046 allows 70; longer ones occur in the wild
 /// and are accepted with a `boundary_invalid` diagnostic up to this length.
@@ -26,7 +27,7 @@ pub const max_boundary_len = 256;
 /// Bytes of a line start needed to decide whether it is a delimiter line.
 const head_cap = 2 + max_boundary_len + 2;
 
-pub const Limits = struct {
+pub const Options = struct {
     /// Deepest part depth (the top-level message is depth 0). A container that would nest its
     /// children deeper is reported with `depth_exceeded` and delivered as one opaque leaf.
     max_depth: u8 = 16,
@@ -36,6 +37,10 @@ pub const Limits = struct {
     /// Most raw header bytes stored for one part. Lines past it are reported with
     /// `header_too_large` and not stored; the walk continues.
     max_header_bytes: u32 = 64 * 1024,
+    /// Also deliver the undecoded body of base64 and quoted-printable parts, as `body` events
+    /// with `raw` set, before the decoded bytes. Lets a scanner check both views of a part
+    /// whose encoding is broken or lies.
+    raw_view: bool = false,
 };
 
 pub const Kind = enum {
@@ -61,6 +66,8 @@ pub const Part = struct {
     content_type: ContentType = .default,
     /// The boundary this multipart splits on (also when `kind` fell back to leaf).
     boundary: ?[]const u8 = null,
+    /// Content-Transfer-Encoding. A leaf's `body` events carry decoded bytes.
+    encoding: decode.Encoding = .none,
 };
 
 pub const Region = enum {
@@ -78,16 +85,22 @@ pub const Body = struct {
     part: *const Part,
     bytes: []const u8,
     region: Region,
+    /// The bytes are the undecoded body of an encoded part (only with `Options.raw_view`).
+    raw: bool = false,
 };
 
 pub const PartEnd = struct {
     part: *const Part,
     /// Body bytes of this part as they appeared in the message, before transfer decoding.
     raw_bytes: u64,
+    /// Bytes delivered as decoded content.
+    decoded_bytes: u64,
+    /// What the transfer decoder tolerated.
+    decode_flags: decode.Flags,
 };
 
 pub const DiagnosticKind = enum {
-    /// A part's header block exceeded `Limits.max_header_bytes`; later lines were not stored.
+    /// A part's header block exceeded `Options.max_header_bytes`; later lines were not stored.
     header_too_large,
     /// The scratch buffer ran out while storing a header block; later lines were not stored.
     scratch_exhausted,
@@ -111,6 +124,15 @@ pub const DiagnosticKind = enum {
     depth_exceeded,
     /// The part limit was reached; the rest of the multipart is delivered as unparsed bytes.
     part_limit,
+    /// The Content-Transfer-Encoding is not one this library decodes; the body is passed on as
+    /// it is.
+    unknown_transfer_encoding,
+    /// A multipart or message part declares base64 or quoted-printable, which RFC 2045 forbids.
+    /// It is delivered as a decoded leaf; walk its content with a second walker to see inside.
+    encoded_container,
+    /// The transfer decoder met invalid input or data after base64 padding (see
+    /// `PartEnd.decode_flags`); it kept going.
+    invalid_encoding,
 };
 
 pub const Diagnostic = struct {
@@ -159,6 +181,8 @@ const Entity = struct {
     mp: MultipartState = .preamble,
     children: u32 = 0,
     raw_bytes: u64 = 0,
+    decoded_bytes: u64 = 0,
+    decoder: decode.Decoder = .identity,
 };
 
 const State = enum { start, header, header_rest, skip_line, body, done };
@@ -179,7 +203,7 @@ const HeaderLine = union(enum) { need_more, blank, field, continuation, other, m
 pub const Walker = struct {
     sink: Sink,
     scratch: []u8,
-    limits: Limits,
+    options: Options,
 
     /// Stream bytes consumed so far.
     offset: u64 = 0,
@@ -194,7 +218,6 @@ pub const Walker = struct {
     state: State = .start,
     after_skip: AfterSkip = .body,
     skip_garbage: bool = false,
-    replaying: bool = false,
     scratch_top: usize = 0,
 
     // Header block being collected.
@@ -219,10 +242,13 @@ pub const Walker = struct {
     cr_pending: bool = false,
     at_line_start: bool = false,
 
-    pub fn init(scratch: []u8, sink: Sink, limits: Limits) Walker {
-        var l = limits;
+    /// Staging buffer for decoded body bytes.
+    out: [4096]u8 = undefined,
+
+    pub fn init(scratch: []u8, sink: Sink, options: Options) Walker {
+        var l = options;
         l.max_depth = @min(l.max_depth, max_depth_cap);
-        return .{ .sink = sink, .scratch = scratch, .limits = l };
+        return .{ .sink = sink, .scratch = scratch, .options = l };
     }
 
     /// Starts the walk at the body of an entity whose header block (`raw_headers`, lines ending
@@ -327,7 +353,17 @@ pub const Walker = struct {
     fn endTop(self: *Walker) Sink.Error!void {
         const e = self.top();
         if (e.part.kind == .multipart and e.mp != .closed) try self.diag(.missing_close_delimiter, &e.part);
-        try self.emit(.{ .part_end = .{ .part = &e.part, .raw_bytes = e.raw_bytes } });
+        if (e.part.kind == .leaf) {
+            try e.decoder.finish(&self.out, DecodedSink{ .walker = self, .entity = e });
+            const f = e.decoder.flags();
+            if (f.invalid_input or f.padding_inside) try self.diag(.invalid_encoding, &e.part);
+        }
+        try self.emit(.{ .part_end = .{
+            .part = &e.part,
+            .raw_bytes = e.raw_bytes,
+            .decoded_bytes = e.decoded_bytes,
+            .decode_flags = e.decoder.flags(),
+        } });
         self.scratch_top = e.mark;
         self.len -= 1;
     }
@@ -443,7 +479,7 @@ pub const Walker = struct {
         }
         if (!self.line_stored) return;
         const by_scratch = self.scratch.len - self.hdr_start;
-        const cap = @min(self.limits.max_header_bytes, by_scratch);
+        const cap = @min(self.options.max_header_bytes, by_scratch);
         if (self.hdr_len + bytes.len <= cap) {
             @memcpy(self.scratch[self.hdr_start + self.hdr_len ..][0..bytes.len], bytes);
             self.hdr_len += bytes.len;
@@ -454,7 +490,7 @@ pub const Walker = struct {
         self.line_stored = false;
         if (!self.hdr_overflow) {
             self.hdr_overflow = true;
-            const kind: DiagnosticKind = if (by_scratch < self.limits.max_header_bytes) .scratch_exhausted else .header_too_large;
+            const kind: DiagnosticKind = if (by_scratch < self.options.max_header_bytes) .scratch_exhausted else .header_too_large;
             try self.diag(kind, &self.top().part);
         }
     }
@@ -500,7 +536,7 @@ pub const Walker = struct {
         self.scratch_top = self.hdr_start + block.len;
         e.part.headers = .{ .block = block };
 
-        var pending: [4]DiagnosticKind = undefined;
+        var pending: [6]DiagnosticKind = undefined;
         var npending: usize = 0;
 
         const in_digest = self.len >= 2 and self.stack[self.len - 2].part.kind == .multipart and
@@ -525,21 +561,36 @@ pub const Walker = struct {
             } else if (ct.boundary.?.len > max_boundary_len) {
                 pending[npending] = .boundary_too_long;
                 npending += 1;
-            } else if (e.part.depth + 1 > self.limits.max_depth) {
+            } else if (e.part.depth + 1 > self.options.max_depth) {
                 pending[npending] = .depth_exceeded;
                 npending += 1;
             } else {
                 kind = .multipart;
             }
         } else if (ct.isEmbeddedMessage()) {
-            if (e.part.depth + 1 > self.limits.max_depth) {
+            if (e.part.depth + 1 > self.options.max_depth) {
                 pending[npending] = .depth_exceeded;
                 npending += 1;
             } else {
                 kind = .message;
             }
         }
+        var encoding: decode.Encoding = .none;
+        if (e.part.headers.get("content-transfer-encoding")) |value| {
+            encoding = decode.Encoding.parse(value);
+            if (encoding == .unknown) {
+                pending[npending] = .unknown_transfer_encoding;
+                npending += 1;
+            }
+        }
+        if (kind != .leaf and !encoding.isIdentity()) {
+            pending[npending] = .encoded_container;
+            npending += 1;
+            kind = .leaf;
+        }
+        e.part.encoding = encoding;
         e.part.kind = kind;
+        if (kind == .leaf) e.decoder = .init(encoding);
 
         try self.emit(.{ .part_begin = &e.part });
         for (pending[0..npending]) |k| try self.diag(k, &e.part);
@@ -637,7 +688,7 @@ pub const Walker = struct {
             return;
         }
         if (f.mp == .overflow) return;
-        if (self.parts >= self.limits.max_parts) {
+        if (self.parts >= self.options.max_parts) {
             f.mp = .overflow;
             try self.diag(.part_limit, &f.part);
             return;
@@ -799,16 +850,34 @@ pub const Walker = struct {
         if (bytes.len == 0) return;
         const e = self.top();
         e.raw_bytes += bytes.len;
-        const region: Region = switch (e.part.kind) {
-            .leaf, .message => .content,
-            .multipart => switch (e.mp) {
-                .preamble => .preamble,
-                .closed => .epilogue,
-                .open, .overflow => .unparsed,
+        switch (e.part.kind) {
+            .leaf, .message => {
+                if (self.options.raw_view and e.decoder != .identity) {
+                    try self.emit(.{ .body = .{ .part = &e.part, .bytes = bytes, .region = .content, .raw = true } });
+                }
+                try e.decoder.feed(bytes, &self.out, DecodedSink{ .walker = self, .entity = e });
             },
-        };
-        try self.emit(.{ .body = .{ .part = &e.part, .bytes = bytes, .region = region } });
+            .multipart => {
+                const region: Region = switch (e.mp) {
+                    .preamble => .preamble,
+                    .closed => .epilogue,
+                    .open, .overflow => .unparsed,
+                };
+                try self.emit(.{ .body = .{ .part = &e.part, .bytes = bytes, .region = region } });
+            },
+        }
     }
+
+    /// Receives decoded bytes from an entity's transfer decoder.
+    const DecodedSink = struct {
+        walker: *Walker,
+        entity: *Entity,
+
+        pub fn write(self: DecodedSink, bytes: []const u8) Sink.Error!void {
+            self.entity.decoded_bytes += bytes.len;
+            try self.walker.emit(.{ .body = .{ .part = &self.entity.part, .bytes = bytes, .region = .content } });
+        }
+    };
 
     // Events
 

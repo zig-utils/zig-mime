@@ -7,10 +7,9 @@ const mime = @import("root.zig");
 const testing = std.testing;
 const Walker = mime.Walker;
 const Transcript = mime.Transcript;
-const Limits = mime.Limits;
 
 pub const Options = struct {
-    limits: Limits = .{},
+    options: mime.Options = .{},
     scratch_len: usize = 4096,
     /// Header block given to `beginWithHeaders` before feeding.
     headers: ?[]const u8 = null,
@@ -41,7 +40,7 @@ pub fn walkCuts(gpa: std.mem.Allocator, input: []const u8, cuts: []const usize, 
     defer t.deinit();
     const scratch = try gpa.alloc(u8, opts.scratch_len);
     defer gpa.free(scratch);
-    var w = Walker.init(scratch, t.sink(), opts.limits);
+    var w = Walker.init(scratch, t.sink(), opts.options);
     if (opts.headers) |h| try w.beginWithHeaders(h);
     var prev: usize = 0;
     for (cuts) |c| {
@@ -59,7 +58,7 @@ pub fn walkChunked(gpa: std.mem.Allocator, input: []const u8, chunk: usize, opts
     defer t.deinit();
     const scratch = try gpa.alloc(u8, opts.scratch_len);
     defer gpa.free(scratch);
-    var w = Walker.init(scratch, t.sink(), opts.limits);
+    var w = Walker.init(scratch, t.sink(), opts.options);
     if (opts.headers) |h| try w.beginWithHeaders(h);
     var i: usize = 0;
     while (i < input.len) : (i += chunk) try w.feed(input[i..@min(i + chunk, input.len)]);
@@ -272,7 +271,7 @@ test "depth limit delivers the deep container as one leaf" {
         \\deep
         \\--b--
         \\--a--
-    ), .{ .limits = .{ .max_depth = 1 } },
+    ), .{ .options = .{ .max_depth = 1 } },
         \\begin 0: multipart multipart/mixed
         \\begin 1:1 leaf multipart/mixed
         \\diag depth_exceeded 1:1
@@ -294,7 +293,7 @@ test "part limit delivers the remaining parts as unparsed bytes" {
         \\
         \\two
         \\--a--
-    ), .{ .limits = .{ .max_parts = 2 } },
+    ), .{ .options = .{ .max_parts = 2 } },
         \\begin 0: multipart multipart/mixed
         \\begin 1:1 leaf text/plain
         \\body 1:1 content one
@@ -316,7 +315,7 @@ test "oversized header blocks are reported and the walk continues" {
         \\
         \\body
         \\--a--
-    ), .{ .limits = .{ .max_header_bytes = 60 } },
+    ), .{ .options = .{ .max_header_bytes = 60 } },
         \\begin 0: multipart multipart/mixed
         \\diag header_too_large 1:1
         \\begin 1:1 leaf text/plain
@@ -458,4 +457,93 @@ test "memory stays fixed while a large nested message streams through" {
     try testing.expect(sink.content >= gen.body_bytes);
     try testing.expect(w.scratch_peak < 512);
     try testing.expect(Walker.memoryFootprint(scratch.len) < 64 * 1024);
+}
+
+test "base64 and quoted-printable parts arrive decoded" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary=a
+        \\
+        \\--a
+        \\Content-Type: application/octet-stream
+        \\Content-Transfer-Encoding: base64
+        \\
+        \\VGhlIHF1aWNrIGJyb3du
+        \\IGZveA==
+        \\--a
+        \\Content-Type: text/plain; charset=utf-8
+        \\Content-Transfer-Encoding: Quoted-Printable
+        \\
+        \\caf=C3=A9 soft=
+        \\break
+        \\--a--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\begin 1:1 leaf application/octet-stream
+        \\body 1:1 content The quick brown fox
+        \\end 1:1
+        \\begin 1:2 leaf text/plain
+        \\body 1:2 content caf\xc3\xa9 softbreak
+        \\end 1:2
+        \\end 0:
+        \\
+    );
+}
+
+test "raw view delivers the undecoded body too" {
+    try expectWalk(crlf(
+        \\Content-Transfer-Encoding: base64
+        \\
+        \\Zm9v
+        \\YmFy
+    ), .{ .options = .{ .raw_view = true } },
+        \\begin 0: leaf text/plain
+        \\body 0: content foobar
+        \\raw 0: Zm9v\r\nYmFy
+        \\end 0:
+        \\
+    );
+}
+
+test "broken encodings are decoded as far as possible and flagged" {
+    try expectWalk(crlf(
+        \\Content-Transfer-Encoding: base64
+        \\
+        \\Zm8=YmFy!
+        \\Zg
+    ), .{},
+        \\begin 0: leaf text/plain
+        \\body 0: content fobarf
+        \\diag invalid_encoding 0:
+        \\end 0: invalid_input padding_inside truncated
+        \\
+    );
+}
+
+test "an encoded multipart is delivered decoded, an unknown encoding as is" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary=a
+        \\
+        \\--a
+        \\Content-Type: multipart/mixed; boundary=b
+        \\Content-Transfer-Encoding: base64
+        \\
+        \\LS1iDQoNCmhpDQotLWItLQ==
+        \\--a
+        \\Content-Transfer-Encoding: x-uuencode
+        \\
+        \\begin 644 x
+        \\--a--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\begin 1:1 leaf multipart/mixed
+        \\diag encoded_container 1:1
+        \\body 1:1 content --b\r\n\r\nhi\r\n--b--
+        \\end 1:1
+        \\begin 1:2 leaf text/plain
+        \\diag unknown_transfer_encoding 1:2
+        \\body 1:2 content begin 644 x
+        \\end 1:2
+        \\end 0:
+        \\
+    );
 }

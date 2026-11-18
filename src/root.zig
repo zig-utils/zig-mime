@@ -9,6 +9,7 @@ const std = @import("std");
 pub const walker = @import("walker.zig");
 pub const headers = @import("headers.zig");
 pub const scan = @import("scan.zig");
+pub const decode = @import("decode.zig");
 
 pub const Walker = walker.Walker;
 pub const Sink = walker.Sink;
@@ -20,9 +21,10 @@ pub const Region = walker.Region;
 pub const PartEnd = walker.PartEnd;
 pub const Diagnostic = walker.Diagnostic;
 pub const DiagnosticKind = walker.DiagnosticKind;
-pub const Limits = walker.Limits;
+pub const Options = walker.Options;
 pub const Headers = headers.Headers;
 pub const ContentType = headers.ContentType;
+pub const Encoding = decode.Encoding;
 pub const Transcript = @import("transcript.zig").Transcript;
 
 pub const version = std.SemanticVersion{ .major = 0, .minor = 0, .patch = 0 };

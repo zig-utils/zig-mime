@@ -43,16 +43,19 @@ try walker.finish();
 
 ### Limits
 
-`mime.Limits` bounds the work per message:
+`mime.Options` bounds the work per message:
 - `max_depth` (16)
 - `max_parts` (10,000)
 - `max_header_bytes` per part (64 KiB)
 
 Reaching a limit emits a diagnostic, and the bytes are still delivered (as an opaque leaf or as `unparsed` multipart bytes), so a scanner never loses content silently.
 
+### Transfer decoding
+
+Leaf bodies arrive decoded: base64 and quoted-printable are decoded on the fly, with partial quanta and escapes carried across chunks. Broken input is decoded as far as it goes rather than dropped. `PartEnd.decode_flags` says what was tolerated, and an `invalid_encoding` diagnostic reports invalid bytes or data after base64 padding. With `.raw_view = true` the undecoded body is delivered as well (`Body.raw`), so a scanner can check both views of a part whose encoding lies. The decoders are usable on their own as `mime.decode.base64.Decoder` and `mime.decode.qp.Decoder`.
+
 ## Planned features
 
-- streaming base64 and quoted-printable decoders
 - header parsing with RFC 2047 and RFC 2231 decoding, plus ContentType and boundary validation
 - fuzz and differential tests
 

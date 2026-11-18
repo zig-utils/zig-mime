@@ -1,5 +1,6 @@
-//! `zig build bench -- <results.json>`: throughput of the boundary scan and the walker, plus a
-//! 100 MB streaming walk that checks peak memory stays fixed.
+//! `zig build bench -- <results.json>`: throughput of the boundary scan, the transfer decoders
+//! and the walker (which decodes the base64 attachments), plus a 100 MB streaming walk that
+//! checks peak memory stays fixed.
 const std = @import("std");
 const builtin = @import("builtin");
 const bench = @import("bench");
@@ -9,6 +10,8 @@ const mib = 1024 * 1024;
 
 var message: []u8 = &.{};
 var base64_lines: []u8 = &.{};
+var qp_text: []u8 = &.{};
+var decode_out: []u8 = &.{};
 var sink_total: u64 = 0;
 
 const CountingSink = struct {
@@ -67,6 +70,28 @@ fn benchScan() void {
         pos += c + 1;
     }
     sink_total +%= hits + pos;
+}
+
+fn benchBase64() void {
+    var d: mime.decode.base64.Decoder = .{};
+    var n = d.decode(base64_lines, decode_out);
+    n += d.finish(decode_out[n..]);
+    sink_total +%= n;
+}
+
+fn benchQp() void {
+    var d: mime.decode.qp.Decoder = .{};
+    var n = d.decode(qp_text, decode_out);
+    n += d.finish(decode_out[n..]);
+    sink_total +%= n;
+}
+
+/// Text with an escape every few words and soft breaks, like a quoted-printable HTML body.
+fn fillQp(buf: []u8) void {
+    const line = "<p>Caf=C3=A9 au lait, cr=C3=A8me br=C3=BBl=C3=A9e and a long run of plain words=\r\n";
+    var i: usize = 0;
+    while (i + line.len <= buf.len) : (i += line.len) @memcpy(buf[i..][0..line.len], line);
+    @memset(buf[i..], 'x');
 }
 
 fn walkAll(data: []const u8, chunk: usize) CountingSink {
@@ -160,10 +185,17 @@ pub fn main(init: std.process.Init) !void {
     base64_lines = try gpa.alloc(u8, 4 * mib);
     defer gpa.free(base64_lines);
     fillBase64Lines(base64_lines, 0);
+    qp_text = try gpa.alloc(u8, 4 * mib);
+    defer gpa.free(qp_text);
+    fillQp(qp_text);
+    decode_out = try gpa.alloc(u8, 5 * mib);
+    defer gpa.free(decode_out);
 
     var results: std.ArrayList(Result) = .empty;
     defer results.deinit(gpa);
     try results.append(gpa, try run(gpa, io, "scan base64 4MiB", benchScan, base64_lines.len));
+    try results.append(gpa, try run(gpa, io, "base64 decode 4MiB", benchBase64, base64_lines.len));
+    try results.append(gpa, try run(gpa, io, "quoted-printable decode 4MiB", benchQp, qp_text.len));
     try results.append(gpa, try run(gpa, io, "walk 16MiB chunks 64KiB", benchWalker, message.len));
     try results.append(gpa, try run(gpa, io, "walk 16MiB chunks 1500B", benchWalkerSmallChunks, message.len));
     std.mem.doNotOptimizeAway(sink_total);
