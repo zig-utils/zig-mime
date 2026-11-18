@@ -22,9 +22,15 @@ const ContentType = headers.ContentType;
 
 /// Deepest nesting the walker can track; `Options.max_depth` is clamped to it.
 pub const max_depth_cap = 32;
-/// Longest boundary the walker will split on. RFC 2046 allows 70; longer ones occur in the wild
-/// and are accepted with a `boundary_invalid` diagnostic up to this length.
-pub const max_boundary_len = 256;
+/// Longest boundary the walker will split on: the longest that fits on an RFC 5322 line with its
+/// "--" and trailing "--". RFC 2046 allows 70; longer ones occur in the wild, and clients split
+/// on them, so they are accepted with a `boundary_invalid` diagnostic.
+pub const max_boundary_len = 994;
+/// Most distinct boundaries one multipart splits on (see `Part.boundaries`).
+pub const max_boundaries = 4;
+/// Header bytes only the first Content-Type, Content-Transfer-Encoding and Content-Disposition
+/// fields may use (at most a quarter of the header limit).
+const key_reserve = 4096;
 /// Bytes of a line start needed to decide whether it is a delimiter line.
 const head_cap = 2 + max_boundary_len + 2;
 
@@ -65,8 +71,12 @@ pub const Part = struct {
     kind: Kind = .leaf,
     headers: Headers = .{},
     content_type: ContentType = .default,
-    /// The boundary this multipart splits on (also when `kind` fell back to leaf).
+    /// The first boundary of this multipart (also set when `kind` fell back to leaf).
     boundary: ?[]const u8 = null,
+    /// Every distinct boundary the multipart splits on: duplicate boundary parameters, several
+    /// Content-Type fields and the RFC 2231 form all count, because parsers disagree on which
+    /// one wins.
+    boundaries: []const []const u8 = &.{},
     /// Content-Transfer-Encoding. A leaf's `body` events carry decoded bytes.
     encoding: decode.Encoding = .none,
     /// The Content-Type charset parameter, as written.
@@ -77,6 +87,9 @@ pub const Part = struct {
     filename: ?[]const u8 = null,
     /// Content-Type name parameter, decoded the same way.
     name: ?[]const u8 = null,
+    /// A different filename from a later duplicate `filename=` parameter or Content-Disposition
+    /// field, which some clients use instead.
+    filename_alt: ?[]const u8 = null,
 };
 
 pub const Region = enum {
@@ -139,6 +152,20 @@ pub const DiagnosticKind = enum {
     depth_exceeded,
     /// The part limit was reached; the rest of the multipart is delivered as unparsed bytes.
     part_limit,
+    /// A Content-Type, Content-Transfer-Encoding or Content-Disposition field appears more than
+    /// once. The view that exposes more content is used (a multipart over a leaf, a decoding
+    /// encoding over identity).
+    duplicate_header,
+    /// The multipart has more than one distinct boundary; it splits on all of them.
+    conflicting_boundary,
+    /// A nested multipart reuses an enclosing multipart's boundary; delimiters go to the
+    /// innermost open one.
+    nested_boundary_reuse,
+    /// A separator delimiter followed the close delimiter of its multipart. The walker reopens
+    /// the multipart and delivers the parts, which some clients show.
+    part_after_close,
+    /// Duplicate filename parameters disagree; see `Part.filename_alt`.
+    conflicting_filename,
     /// The Content-Transfer-Encoding is not one this library decodes; the body is passed on as
     /// it is.
     unknown_transfer_encoding,
@@ -188,13 +215,17 @@ pub const Sink = struct {
 
 /// Diagnostics found while parsing a header block, emitted right after its part_begin.
 const Pending = struct {
-    kinds: [8]DiagnosticKind = undefined,
+    kinds: [16]DiagnosticKind = undefined,
     len: usize = 0,
 
     fn add(self: *Pending, kind: DiagnosticKind) void {
-        if (self.len == self.kinds.len) return;
+        if (self.has(kind) or self.len == self.kinds.len) return;
         self.kinds[self.len] = kind;
         self.len += 1;
+    }
+
+    fn has(self: *const Pending, kind: DiagnosticKind) bool {
+        return std.mem.indexOfScalar(DiagnosticKind, self.kinds[0..self.len], kind) != null;
     }
 };
 
@@ -210,6 +241,8 @@ const Entity = struct {
     raw_bytes: u64 = 0,
     decoded_bytes: u64 = 0,
     decoder: decode.Decoder = .identity,
+    boundaries: [max_boundaries][]const u8 = undefined,
+    boundary_count: u8 = 0,
 };
 
 const State = enum { start, header, header_rest, skip_line, body, done };
@@ -254,6 +287,9 @@ pub const Walker = struct {
     line_start: usize = 0,
     line_len: usize = 0,
     line_stored: bool = false,
+    line_key: bool = false,
+    field_stored: bool = false,
+    keys_seen: u8 = 0,
     long_line_reported: bool = false,
     first_line: bool = false,
 
@@ -286,7 +322,7 @@ pub const Walker = struct {
         self.pushChild();
         self.beginHeaders();
         self.long_line_reported = true; // several lines arrive as one; per-line length is unknown
-        try self.startStoredLine(raw_headers);
+        try self.startStoredLine(raw_headers, .block);
         if (raw_headers.len > 0 and raw_headers[raw_headers.len - 1] != '\n') try self.appendStoredLine("\n");
         try self.endHeaders();
     }
@@ -402,6 +438,8 @@ pub const Walker = struct {
         self.hdr_len = 0;
         self.hdr_overflow = false;
         self.line_stored = false;
+        self.field_stored = false;
+        self.keys_seen = 0;
         self.long_line_reported = false;
         self.head_len = 0;
         self.state = .header;
@@ -433,7 +471,7 @@ pub const Walker = struct {
             .need_more => unreachable,
             .blank => try self.endHeaders(),
             .field, .continuation => {
-                try self.startStoredLine(line);
+                try self.startStoredLine(line, if (class == .field) .field else .continuation);
                 if (complete) self.finishLine() else self.state = .header_rest;
             },
             .mbox_from => {
@@ -471,7 +509,7 @@ pub const Walker = struct {
             },
             .field, .continuation => {
                 self.first_line = false;
-                try self.startStoredLine(line[0..n]);
+                try self.startStoredLine(line[0..n], if (class == .field) .field else .continuation);
                 self.finishLine();
             },
             else => try self.applyHeaderLine(class, line[0..n], true),
@@ -491,11 +529,44 @@ pub const Walker = struct {
         self.head_len = 0;
     }
 
-    fn startStoredLine(self: *Walker, bytes: []const u8) Sink.Error!void {
+    const LineKind = enum { field, continuation, block };
+
+    /// Starts storing a header line. Lines that do not fit are dropped one by one (later lines
+    /// that fit are still kept), and a continuation is kept only with the field it continues.
+    /// The first Content-Type, Content-Transfer-Encoding and Content-Disposition fields may use
+    /// a reserve that other fields cannot, so padding a header block with junk fields cannot
+    /// push them out.
+    fn startStoredLine(self: *Walker, bytes: []const u8, kind: LineKind) Sink.Error!void {
         self.line_start = self.hdr_len;
         self.line_len = 0;
-        self.line_stored = !self.hdr_overflow;
+        switch (kind) {
+            .field => {
+                self.line_key = self.claimKeyField(bytes);
+                self.line_stored = true;
+            },
+            .continuation => self.line_stored = self.field_stored,
+            .block => {
+                self.line_key = true;
+                self.line_stored = true;
+            },
+        }
         try self.appendStoredLine(bytes);
+        if (kind != .continuation) self.field_stored = self.line_stored;
+    }
+
+    /// True for the first occurrence of a field the walker interprets.
+    fn claimKeyField(self: *Walker, line: []const u8) bool {
+        const keys = [_][]const u8{ "content-type", "content-transfer-encoding", "content-disposition" };
+        const colon = headers.fieldColon(line) orelse return false;
+        const name = std.mem.trimEnd(u8, line[0..colon], " \t");
+        for (keys, 0..) |k, i| {
+            const bit = @as(u8, 1) << @intCast(i);
+            if (std.ascii.eqlIgnoreCase(name, k) and self.keys_seen & bit == 0) {
+                self.keys_seen |= bit;
+                return true;
+            }
+        }
+        return false;
     }
 
     fn appendStoredLine(self: *Walker, bytes: []const u8) Sink.Error!void {
@@ -506,7 +577,8 @@ pub const Walker = struct {
         }
         if (!self.line_stored) return;
         const by_scratch = self.scratch.len - self.hdr_start;
-        const cap = @min(self.options.max_header_bytes, by_scratch);
+        const full = @min(self.options.max_header_bytes, by_scratch);
+        const cap = if (self.line_key) full else full - @min(key_reserve, full / 4);
         if (self.hdr_len + bytes.len <= cap) {
             @memcpy(self.scratch[self.hdr_start + self.hdr_len ..][0..bytes.len], bytes);
             self.hdr_len += bytes.len;
@@ -565,37 +637,63 @@ pub const Walker = struct {
 
         var pending: Pending = .{};
 
+        // Content-Type: the first field that parses, unless a later one is a multipart with a
+        // boundary and the chosen one is not; then the multipart view wins, so its parts are
+        // walked.
         const in_digest = self.len >= 2 and self.stack[self.len - 2].part.kind == .multipart and
             self.stack[self.len - 2].part.content_type.is("multipart", "digest");
         var ct: ContentType = if (in_digest) .digest_default else .default;
-        if (e.part.headers.get("content-type")) |value| {
-            if (ContentType.parse(value)) |parsed| {
-                ct = parsed;
-            } else |_| pending.add(.invalid_content_type);
+        var have_ct = false;
+        var count: usize = 0;
+        var it = e.part.headers.iterator();
+        while (it.next()) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "content-type")) continue;
+            count += 1;
+            const parsed = ContentType.parse(f.value) catch {
+                if (count == 1) pending.add(.invalid_content_type);
+                continue;
+            };
+            if (!have_ct or (isSplittable(parsed) and !isSplittable(ct))) ct = parsed;
+            have_ct = true;
         }
+        if (count > 1) pending.add(.duplicate_header);
         e.part.content_type = ct;
         e.part.charset = ct.charset;
 
         var kind: Kind = .leaf;
         if (ct.isMultipart()) {
-            e.part.boundary = self.boundaryOf(ct);
-            const b = e.part.boundary orelse "";
-            if (b.len == 0) {
-                pending.add(.multipart_without_boundary);
-            } else if (b.len > max_boundary_len) {
-                pending.add(.boundary_too_long);
-            } else {
-                headers.validateBoundary(b) catch pending.add(.boundary_invalid);
+            self.collectBoundaries(e, &pending);
+            if (e.boundary_count > 0) {
+                for (e.boundaries[0..e.boundary_count]) |b| {
+                    headers.validateBoundary(b) catch pending.add(.boundary_invalid);
+                    for (self.stack[0 .. self.len - 1]) |*anc| {
+                        if (anc.part.kind != .multipart) continue;
+                        for (anc.part.boundaries) |ab| {
+                            if (std.mem.eql(u8, ab, b)) pending.add(.nested_boundary_reuse);
+                        }
+                    }
+                }
                 if (e.part.depth + 1 > self.options.max_depth) pending.add(.depth_exceeded) else kind = .multipart;
+            } else if (!pending.has(.boundary_too_long)) {
+                pending.add(.multipart_without_boundary);
             }
         } else if (ct.isEmbeddedMessage()) {
             if (e.part.depth + 1 > self.options.max_depth) pending.add(.depth_exceeded) else kind = .message;
         }
+
+        // Content-Transfer-Encoding: the first, unless a later one decodes and it does not; then
+        // the decoded view wins and `Options.raw_view` still offers the undecoded one.
         var encoding: decode.Encoding = .none;
-        if (e.part.headers.get("content-transfer-encoding")) |value| {
-            encoding = decode.Encoding.parse(value);
-            if (encoding == .unknown) pending.add(.unknown_transfer_encoding);
+        count = 0;
+        it = e.part.headers.iterator();
+        while (it.next()) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "content-transfer-encoding")) continue;
+            count += 1;
+            const enc = decode.Encoding.parse(f.value);
+            if (count == 1 or (encoding.isIdentity() and !enc.isIdentity())) encoding = enc;
         }
+        if (count > 1) pending.add(.duplicate_header);
+        if (encoding == .unknown) pending.add(.unknown_transfer_encoding);
         if (kind != .leaf and !encoding.isIdentity()) {
             pending.add(.encoded_container);
             kind = .leaf;
@@ -610,7 +708,9 @@ pub const Walker = struct {
             e.part.disposition = d.kind;
             disposition_params = d.params;
         }
+        if (e.part.headers.count("content-disposition") > 1) pending.add(.duplicate_header);
         e.part.filename = self.decodeParam(disposition_params, "filename", &pending);
+        if (e.part.filename) |first| e.part.filename_alt = self.alternateFilename(e, first, &pending);
         e.part.name = self.decodeParam(ct.params, "name", &pending);
 
         try self.emit(.{ .part_begin = &e.part });
@@ -629,15 +729,85 @@ pub const Walker = struct {
         }
     }
 
-    /// The boundary parameter with quoted-string escapes removed (into scratch when it has any).
-    fn boundaryOf(self: *Walker, ct: ContentType) ?[]const u8 {
-        const p = headers.findParam(ct.params, "boundary") orelse return null;
-        if (!p.quoted or std.mem.indexOfScalar(u8, p.value, '\\') == null) return p.value;
+    fn isSplittable(ct: ContentType) bool {
+        return ct.isMultipart() and ct.boundary != null;
+    }
+
+    /// Every distinct boundary of every multipart Content-Type field: each `boundary=` and the
+    /// RFC 2231 form. Parsers disagree on which duplicate wins, so the walker splits on all of
+    /// them and reports `conflicting_boundary`.
+    fn collectBoundaries(self: *Walker, e: *Entity, pending: *Pending) void {
+        var it = e.part.headers.iterator();
+        while (it.next()) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "content-type")) continue;
+            const ct = ContentType.parse(f.value) catch continue;
+            if (!ct.isMultipart()) continue;
+            var params = ct.paramIterator();
+            while (params.next()) |p| {
+                if (!std.ascii.eqlIgnoreCase(p.name, "boundary")) continue;
+                var b = p.value;
+                if (p.quoted and std.mem.indexOfScalar(u8, b, '\\') != null) {
+                    const room = self.scratch[self.scratch_top..];
+                    if (room.len >= b.len) {
+                        b = headers.unquote(b, room);
+                        self.bump(b.len);
+                    }
+                }
+                addBoundary(e, b, pending);
+            }
+            if (text.decodeExtendedParam(ct.params, "boundary", self.scratch[self.scratch_top..])) |r| {
+                self.bump(r.text.len);
+                addBoundary(e, r.text, pending);
+            }
+        }
+        if (e.boundary_count > 0) e.part.boundary = e.boundaries[0];
+        e.part.boundaries = e.boundaries[0..e.boundary_count];
+        if (e.boundary_count > 1) pending.add(.conflicting_boundary);
+    }
+
+    fn addBoundary(e: *Entity, b: []const u8, pending: *Pending) void {
+        if (b.len == 0) return;
+        if (b.len > max_boundary_len) {
+            pending.add(.boundary_too_long);
+            return;
+        }
+        for (e.boundaries[0..e.boundary_count]) |have| {
+            if (std.mem.eql(u8, have, b)) return;
+        }
+        if (e.boundary_count == max_boundaries) return;
+        e.boundaries[e.boundary_count] = b;
+        e.boundary_count += 1;
+    }
+
+    /// The last plain `filename=` of any Content-Disposition field, when it differs from the
+    /// chosen filename: clients disagree on which duplicate wins.
+    fn alternateFilename(self: *Walker, e: *Entity, first: []const u8, pending: *Pending) ?[]const u8 {
+        var last: ?headers.Param = null;
+        var plain: usize = 0;
+        var extended = false;
+        var it = e.part.headers.iterator();
+        while (it.next()) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "content-disposition")) continue;
+            var params: headers.ParamIterator = .{ .rest = headers.Disposition.parse(f.value).params };
+            while (params.next()) |p| {
+                if (std.ascii.eqlIgnoreCase(p.name, "filename")) {
+                    last = p;
+                    plain += 1;
+                } else if (p.name.len > 8 and std.ascii.eqlIgnoreCase(p.name[0..9], "filename*")) {
+                    extended = true;
+                }
+            }
+        }
+        if (plain == 0 or (plain == 1 and !extended)) return null;
+        const p = last.?;
         const room = self.scratch[self.scratch_top..];
-        if (room.len < p.value.len) return p.value;
-        const b = headers.unquote(p.value, room);
-        self.bump(b.len);
-        return b;
+        var raw: [1024]u8 = undefined;
+        const unq = if (p.quoted and p.value.len <= raw.len) headers.unquote(p.value, &raw) else p.value;
+        const r = text.decodeWords(unq, room);
+        if (std.mem.eql(u8, r.text, first)) return null;
+        self.bump(r.text.len);
+        pending.add(.conflicting_filename);
+        return r.text;
     }
 
     /// Decodes a filename-like parameter (RFC 2231, RFC 2047) into scratch.
@@ -674,26 +844,27 @@ pub const Walker = struct {
             i -= 1;
             const e = &self.stack[i];
             if (e.part.kind != .multipart) continue;
-            const b = e.part.boundary.?;
-            const m = matchBoundary(line, b, complete);
-            const rank: u8 = switch (m) {
-                .undecided => return .need_more,
-                .no => continue,
-                .exact => if (e.mp == .closed) 1 else 0,
-                .prefix => if (e.mp == .closed) 3 else 2,
-            };
-            if (rank < best_rank) {
-                best_rank = rank;
-                const close = switch (m) {
-                    .exact, .prefix => |c| c,
-                    else => unreachable,
+            for (e.part.boundaries) |b| {
+                const m = matchBoundary(line, b, complete);
+                const rank: u8 = switch (m) {
+                    .undecided => return .need_more,
+                    .no => continue,
+                    .exact => if (e.mp == .closed) 1 else 0,
+                    .prefix => if (e.mp == .closed) 3 else 2,
                 };
-                best = .{
-                    .level = @intCast(i),
-                    .close = close,
-                    .exact = m == .exact,
-                    .len = 2 + b.len + @as(usize, if (close) 2 else 0),
-                };
+                if (rank < best_rank) {
+                    best_rank = rank;
+                    const close = switch (m) {
+                        .exact, .prefix => |c| c,
+                        else => unreachable,
+                    };
+                    best = .{
+                        .level = @intCast(i),
+                        .close = close,
+                        .exact = m == .exact,
+                        .len = 2 + b.len + @as(usize, if (close) 2 else 0),
+                    };
+                }
             }
         }
         return if (best) |d| .{ .delim = d } else .not;
@@ -733,6 +904,7 @@ pub const Walker = struct {
             return;
         }
         if (f.mp == .overflow) return;
+        if (f.mp == .closed) try self.diag(.part_after_close, &f.part);
         if (self.parts >= self.options.max_parts) {
             f.mp = .overflow;
             try self.diag(.part_limit, &f.part);

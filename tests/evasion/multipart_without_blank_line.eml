@@ -1,0 +1,16 @@
+X-Evasion: nested multipart header followed directly by its delimiter
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+Content-Type: multipart/mixed; boundary=inner
+--inner
+Content-Type: application/octet-stream; name="payload.exe"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="payload.exe"
+
+WklHLU1JTUUtRVZBU0lPTi1NQVJLRVIgYXR0YWNobWVudCBwYXlsb2FkIAABAiBNWpAA
+--inner--
+--real--

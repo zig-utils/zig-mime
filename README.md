@@ -66,6 +66,29 @@ Parameter parsing respects quoted strings and comments, so a `boundary=` hidden 
 
 `mime.decodeWords` (RFC 2047) and `mime.decodeParam` (RFC 2231) decode other header text into a caller buffer. Supported charsets are UTF-8, US-ASCII, ISO-8859-1 and Windows-1252; other charsets are copied unconverted and flagged.
 
+### Malformed input
+
+Attackers hide attachments in the gaps between parsers, so where interpretations differ the walker takes the view that exposes the most content and reports a diagnostic. Each tolerance has a sample in `tests/evasion/` that must still yield its attachment:
+
+| Input | Behaviour | Diagnostic |
+|---|---|---|
+| Bare LF or mixed line endings | Lines end at LF everywhere, including the header terminator | none |
+| No close delimiter | Parts end at an outer delimiter or the end of input | `missing_close_delimiter` |
+| Several `boundary` parameters, several Content-Type fields, RFC 2231 `boundary*` | Splits on every distinct boundary (`Part.boundaries`) | `conflicting_boundary`, `duplicate_header` |
+| `boundary=` inside another parameter's quoted value | Ignored; quoted strings and comments are parsed | none |
+| Delimiter with trailing garbage (`--bXYZ`) | Splits, as prefix-matching clients do | `boundary_suffix` |
+| Parts after the close delimiter | The multipart is reopened | `part_after_close` |
+| Nested multipart reusing the outer boundary | Innermost open multipart takes the delimiters | `nested_boundary_reuse` |
+| Header block without a blank line | The first non-field line starts the body | `missing_header_separator` |
+| base64 or quoted-printable on a multipart or message | Decoded and delivered as a leaf; walk it again to look inside | `encoded_container` |
+| Duplicate Content-Transfer-Encoding | The decoding one wins; `raw_view` gives the other view | `duplicate_header` |
+| Junk header fields pushing Content-* fields past the header limit | The first Content-Type, Content-Transfer-Encoding and Content-Disposition fields have a reserve | `header_too_large` |
+| Duplicate filenames | `Part.filename` and `Part.filename_alt` | `conflicting_filename` |
+| Overlong or invalid boundaries | Used anyway, up to 994 characters | `boundary_invalid` |
+| Nesting or part count over the limits | Bytes delivered as an opaque leaf or `unparsed` bytes | `depth_exceeded`, `part_limit` |
+
+Lines ending in a bare CR (old Mac OS) are not treated as line breaks.
+
 ## Planned features
 
 - fuzz and differential tests

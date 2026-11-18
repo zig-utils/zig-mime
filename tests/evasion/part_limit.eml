@@ -1,0 +1,49 @@
+X-Evasion: more parts than the part limit allows
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+
+filler 0
+--real
+
+filler 1
+--real
+
+filler 2
+--real
+
+filler 3
+--real
+
+filler 4
+--real
+
+filler 5
+--real
+
+filler 6
+--real
+
+filler 7
+--real
+
+filler 8
+--real
+
+filler 9
+--real
+
+filler 10
+--real
+
+filler 11
+--real
+Content-Type: application/octet-stream; name="payload.exe"
+Content-Transfer-Encoding: 7bit
+Content-Disposition: attachment; filename="payload.exe"
+
+ZIG-MIME-EVASION-MARKER plain
+--real--

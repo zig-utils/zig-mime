@@ -1,0 +1,13 @@
+X-Evasion: Content-Transfer-Encoding 7bit, then base64
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: 7bit
+Content-Transfer-Encoding: base64
+
+WklHLU1JTUUtRVZBU0lPTi1NQVJLRVIgYXR0YWNobWVudCBwYXlsb2FkIAABAiBNWpAA
+--real--

@@ -305,7 +305,7 @@ test "part limit delivers the remaining parts as unparsed bytes" {
     );
 }
 
-test "oversized header blocks are reported and the walk continues" {
+test "oversized header blocks are reported and Content-* fields keep their reserve" {
     try expectWalk(crlf(
         \\Content-Type: multipart/mixed; boundary=a
         \\
@@ -318,7 +318,7 @@ test "oversized header blocks are reported and the walk continues" {
     ), .{ .options = .{ .max_header_bytes = 60 } },
         \\begin 0: multipart multipart/mixed
         \\diag header_too_large 1:1
-        \\begin 1:1 leaf text/plain
+        \\begin 1:1 leaf text/html
         \\body 1:1 content body
         \\end 1:1
         \\end 0:
@@ -337,9 +337,9 @@ test "scratch exhaustion is reported" {
         \\body
         \\--a--
     ), .{ .scratch_len = 70 },
+        \\diag scratch_exhausted 0:
         \\begin 0: multipart multipart/mixed
-        \\diag scratch_exhausted 1:1
-        \\begin 1:1 leaf text/plain
+        \\begin 1:1 leaf text/html
         \\body 1:1 content body
         \\end 1:1
         \\end 0:
@@ -605,4 +605,88 @@ test "Part exposes charset, disposition and encoding" {
         "Content-Disposition: inline\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nx");
     try w.finish();
     try testing.expect(probe.seen);
+}
+
+test "duplicate boundary parameters split on every boundary" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary=x; boundary=y
+        \\
+        \\--x
+        \\
+        \\one
+        \\--y
+        \\
+        \\two
+        \\--y--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\diag conflicting_boundary 0:
+        \\begin 1:1 leaf text/plain
+        \\body 1:1 content one
+        \\end 1:1
+        \\begin 1:2 leaf text/plain
+        \\body 1:2 content two
+        \\end 1:2
+        \\end 0:
+        \\
+    );
+}
+
+test "parts after the close delimiter are reopened and reported" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary=x
+        \\
+        \\--x
+        \\
+        \\one
+        \\--x--
+        \\between
+        \\--x
+        \\
+        \\hidden
+        \\--x--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\begin 1:1 leaf text/plain
+        \\body 1:1 content one
+        \\end 1:1
+        \\body 0: epilogue between
+        \\diag part_after_close 0:
+        \\begin 1:2 leaf text/plain
+        \\body 1:2 content hidden
+        \\end 1:2
+        \\end 0:
+        \\
+    );
+}
+
+test "a nested multipart reusing the outer boundary takes delimiters until it closes" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary=x
+        \\
+        \\--x
+        \\Content-Type: multipart/alternative; boundary=x
+        \\
+        \\--x
+        \\
+        \\inner
+        \\--x--
+        \\--x
+        \\
+        \\outer
+        \\--x--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\begin 1:1 multipart multipart/alternative
+        \\diag nested_boundary_reuse 1:1
+        \\begin 2:1.1 leaf text/plain
+        \\body 2:1.1 content inner
+        \\end 2:1.1
+        \\end 1:1
+        \\begin 1:2 leaf text/plain
+        \\body 1:2 content outer
+        \\end 1:2
+        \\end 0:
+        \\
+    );
 }

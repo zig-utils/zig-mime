@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/evasion.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mime", .module = mime }},
+    }) })).step);
 
     const fuzz_exe = b.addExecutable(.{
         .name = "fuzz",

@@ -1,0 +1,15 @@
+X-Evasion: quoted-printable with every byte escaped and soft breaks
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+Content-Type: application/octet-stream; name="payload.exe"
+Content-Transfer-Encoding: quoted-printable
+Content-Disposition: attachment; filename="payload.exe"
+
+=5A=49=47=2D=4D=49=4D=45=2D=45=56=41=53=49=4F=4E=2D=4D=41=52=4B=45=52=20=
+=61=74=74=61=63=68=6D=65=6E=74=20=70=61=79=6C=6F=61=64=20=00=01=02=20=4D=
+=5A=90=00
+--real--

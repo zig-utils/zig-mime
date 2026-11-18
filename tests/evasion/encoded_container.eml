@@ -1,0 +1,16 @@
+X-Evasion: a base64-encoded multipart, forbidden by RFC 2045
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+Content-Type: multipart/mixed; boundary=inner
+Content-Transfer-Encoding: base64
+
+LS1pbm5lcg0KQ29udGVudC1UeXBlOiBhcHBsaWNhdGlvbi9vY3RldC1zdHJlYW07IG5hbWU9InBh
+eWxvYWQuZXhlIg0KQ29udGVudC1UcmFuc2Zlci1FbmNvZGluZzogYmFzZTY0DQpDb250ZW50LURp
+c3Bvc2l0aW9uOiBhdHRhY2htZW50OyBmaWxlbmFtZT0icGF5bG9hZC5leGUiDQoNCldrbEhMVTFK
+VFVVdFJWWkJVMGxQVGkxTlFWSkxSVklnWVhSMFlXTm9iV1Z1ZENCd1lYbHNiMkZrSUFBQkFpQk5X
+cEFBDQotLWlubmVyLS0NCg==
+--real--

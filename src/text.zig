@@ -212,6 +212,22 @@ const param_cap = 2048;
 /// RFC 2047 encoded words, which many senders put in filenames; they are decoded too.
 /// Returns null when the parameter is absent.
 pub fn decodeParam(params: []const u8, name: []const u8, out: []u8) ?Result {
+    if (decodeExtendedParam(params, name, out)) |r| return r;
+    var flags: Flags = .{};
+    var raw: [param_cap]u8 = undefined;
+    var it: headers.ParamIterator = .{ .rest = params };
+    while (it.next()) |p| {
+        if (!std.ascii.eqlIgnoreCase(p.name, name)) continue;
+        const n = unquoteInto(p, &raw, &flags);
+        const r = decodeWords(raw[0..n], out);
+        return .{ .text = r.text, .flags = r.flags.merge(flags) };
+    }
+    return null;
+}
+
+/// Only the RFC 2231 forms of parameter `name` (`name*=` or `name*0=`, `name*1*=`, ...),
+/// decoded to UTF-8; null when the parameter has none.
+pub fn decodeExtendedParam(params: []const u8, name: []const u8, out: []u8) ?Result {
     var flags: Flags = .{};
     var raw: [param_cap]u8 = undefined;
     var raw_len: usize = 0;
@@ -238,20 +254,10 @@ pub fn decodeParam(params: []const u8, name: []const u8, out: []u8) ?Result {
             }
         }
     }
-    if (found_extended) {
-        var w: usize = 0;
-        appendCharset(charset, raw[0..raw_len], out, &w, &flags);
-        return .{ .text = out[0..w], .flags = flags };
-    }
-
-    var it: headers.ParamIterator = .{ .rest = params };
-    while (it.next()) |p| {
-        if (!std.ascii.eqlIgnoreCase(p.name, name)) continue;
-        const n = unquoteInto(p, &raw, &flags);
-        const r = decodeWords(raw[0..n], out);
-        return .{ .text = r.text, .flags = r.flags.merge(flags) };
-    }
-    return null;
+    if (!found_extended) return null;
+    var w: usize = 0;
+    appendCharset(charset, raw[0..raw_len], out, &w, &flags);
+    return .{ .text = out[0..w], .flags = flags };
 }
 
 /// The parameter `name*` (index null) or `name*<index>` / `name*<index>*`.

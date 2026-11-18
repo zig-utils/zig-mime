@@ -1,0 +1,13 @@
+X-Evasion: non-alphabet characters interleaved in base64
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+Content-Type: application/octet-stream; name="payload.exe"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="payload.exe"
+
+WklH*L!U1JTU!UtRVZ!BU0lP!T*i1NQ!VJLRV!IgYXR!0YW*No!bWVud!CBwYX!lsb2F!*kIAAB!AiBNW!pAA
+--real--

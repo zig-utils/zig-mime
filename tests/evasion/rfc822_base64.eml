@@ -1,0 +1,17 @@
+X-Evasion: a base64-encoded message/rfc822 part
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+Content-Type: message/rfc822
+Content-Transfer-Encoding: base64
+
+U3ViamVjdDogaW5uZXINCkNvbnRlbnQtVHlwZTogbXVsdGlwYXJ0L21peGVkOyBib3VuZGFyeT1p
+bm5lcg0KDQotLWlubmVyDQpDb250ZW50LVR5cGU6IGFwcGxpY2F0aW9uL29jdGV0LXN0cmVhbTsg
+bmFtZT0icGF5bG9hZC5leGUiDQpDb250ZW50LVRyYW5zZmVyLUVuY29kaW5nOiBiYXNlNjQNCkNv
+bnRlbnQtRGlzcG9zaXRpb246IGF0dGFjaG1lbnQ7IGZpbGVuYW1lPSJwYXlsb2FkLmV4ZSINCg0K
+V2tsSExVMUpUVVV0UlZaQlUwbFBUaTFOUVZKTFJWSWdZWFIwWVdOb2JXVnVkQ0J3WVhsc2IyRmtJ
+QUFCQWlCTldwQUENCi0taW5uZXItLQ0K
+--real--

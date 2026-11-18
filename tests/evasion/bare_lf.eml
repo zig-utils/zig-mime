@@ -1,0 +1,16 @@
+X-Evasion: bare LF line endings everywhere
+From: a@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="real"
+
+--real
+
+hello
+--real
+Content-Type: application/octet-stream; name="payload.exe"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="payload.exe"
+
+WklHLU1JTUUtRVZBU0lPTi1NQVJLRVIgYXR0YWNobWVudCBwYXlsb2FkIAABAiBNWpAA
+--real--
