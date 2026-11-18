@@ -16,6 +16,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) })).step);
+    const mail_reference = b.createModule(.{
+        .root_source_file = b.path("tests/mail_reference.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/differential.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mime", .module = mime },
+            .{ .name = "mail_reference", .module = mail_reference },
+        },
+    }) })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tests/evasion.zig"),
         .target = target,
@@ -35,7 +49,8 @@ pub fn build(b: *std.Build) void {
     const run_fuzz = b.addRunArtifact(fuzz_exe);
     const fuzz_iterations = b.option(usize, "fuzz-iterations", "Deterministic fuzz case count") orelse 10_000;
     const fuzz_seed = b.option(u64, "fuzz-seed", "Deterministic fuzz seed") orelse 0x5eed_5eed;
-    run_fuzz.addArgs(&.{ b.fmt("{d}", .{fuzz_iterations}), b.fmt("{d}", .{fuzz_seed}) });
+    const fuzz_seconds = b.option(u64, "fuzz-seconds", "Fuzz for this long instead of a case count") orelse 0;
+    run_fuzz.addArgs(&.{ b.fmt("{d}", .{fuzz_iterations}), b.fmt("{d}", .{fuzz_seed}), b.fmt("{d}", .{fuzz_seconds}) });
     b.step("fuzz", "Run deterministic fuzz cases").dependOn(&run_fuzz.step);
 
     const bench_step = b.step("bench", "Run benchmarks and write a JSON result file");
