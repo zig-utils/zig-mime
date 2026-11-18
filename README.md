@@ -10,9 +10,48 @@ Built for [Guardian](https://github.com/stacksjs/guardian)'s scanner and for the
 
 > Pre-alpha. Planned work is tracked as issues in this repository.
 
+## Usage
+
+A `Walker` is a push parser. Feed it chunks of any size and it calls your sink with events. It never allocates: its own state is a few kilobytes, and header blocks of the open parts live in a scratch buffer you provide.
+
+```zig
+const mime = @import("mime");
+
+const Scanner = struct {
+    pub fn onEvent(self: *Scanner, event: mime.Event) mime.Sink.Error!void {
+        switch (event) {
+            .part_begin => |part| {}, // part.content_type, part.headers, part.path, part.depth
+            .body => |b| {}, // b.bytes, b.region (content, preamble, epilogue, unparsed)
+            .part_end => |e| {}, // e.part, e.raw_bytes
+            .diagnostic => |d| {}, // d.kind: a limit reached or a malformation tolerated
+        }
+        _ = self;
+    }
+};
+
+var scanner: Scanner = .{};
+var scratch: [64 * 1024]u8 = undefined;
+var walker = mime.Walker.init(&scratch, mime.Sink.init(&scanner), .{});
+while (try reader.next()) |chunk| try walker.feed(chunk);
+try walker.finish();
+```
+
+- A `Part` and its header slices stay valid until that part's `part_end`.
+- Body slices are only valid during the call.
+- Return `error.Aborted` from `onEvent` to stop the walk.
+- For an HTTP body, call `walker.beginWithHeaders("Content-Type: multipart/form-data; boundary=...")` before feeding. The stream then starts at the body instead of at a header block.
+
+### Limits
+
+`mime.Limits` bounds the work per message:
+- `max_depth` (16)
+- `max_parts` (10,000)
+- `max_header_bytes` per part (64 KiB)
+
+Reaching a limit emits a diagnostic, and the bytes are still delivered (as an opaque leaf or as `unparsed` multipart bytes), so a scanner never loses content silently.
+
 ## Planned features
 
-- SIMD boundary search over streamed input, with a nested multipart stack and depth limits
 - streaming base64 and quoted-printable decoders
 - header parsing with RFC 2047 and RFC 2231 decoding, plus ContentType and boundary validation
 - fuzz and differential tests
