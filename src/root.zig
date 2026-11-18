@@ -32,7 +32,7 @@ pub const decodeWords = text.decodeWords;
 pub const decodeParam = text.decodeParam;
 pub const Transcript = @import("transcript.zig").Transcript;
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 0, .patch = 0 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 
 test {
     std.testing.refAllDecls(@This());

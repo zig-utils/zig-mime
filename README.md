@@ -8,11 +8,21 @@ A streaming MIME parser for Zig. It walks nested multipart messages with bounded
 
 Built for [Guardian](https://github.com/stacksjs/guardian)'s scanner and for the mail server, and shared with zig-waf's multipart handling where its compatibility evidence allows.
 
-> Pre-alpha. Planned work is tracked as issues in this repository.
+## Installation
+
+```sh
+zig fetch --save https://registry.pantry.dev/zig/packages/zig-mime/0.1.0/tarball
+```
+
+```zig
+// build.zig
+const mime = b.dependency("zig_mime", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("mime", mime.module("mime"));
+```
 
 ## Usage
 
-A `Walker` is a push parser. Feed it chunks of any size and it calls your sink with events. It never allocates: its own state is a few kilobytes, and header blocks of the open parts live in a scratch buffer you provide.
+A `Walker` is a push parser. Feed it chunks of any size and it calls your sink with events. It never allocates: its own state is about 16 KiB, and header blocks of the open parts live in a scratch buffer you provide.
 
 ```zig
 const mime = @import("mime");
@@ -38,6 +48,7 @@ try walker.finish();
 
 - A `Part` and its header slices stay valid until that part's `part_end`.
 - Body slices are only valid during the call.
+- Do not copy or move a walker once it has been fed: events point into it.
 - Return `error.Aborted` from `onEvent` to stop the walk.
 - For an HTTP body, call `walker.beginWithHeaders("Content-Type: multipart/form-data; boundary=...")` before feeding. The stream then starts at the body instead of at a header block.
 
@@ -89,9 +100,29 @@ Attackers hide attachments in the gaps between parsers, so where interpretations
 
 Lines ending in a bare CR (old Mac OS) are not treated as line breaks.
 
-## Planned features
+## Testing
 
-- fuzz and differential tests
+- **Unit tests**: every expected event transcript is checked three ways: the message fed whole, split into two chunks at every offset, and fed one byte at a time.
+- **Evasion corpus** (`tests/evasion/`): every sample must yield its attachment and report its tolerances.
+- **Differential tests** (`tests/differential.zig`) run against the mail server's parser. Generated well-formed messages must parse identically, both the parts and the Content-Type fields. On the evasion corpus, whether the two parsers agree is pinned per sample, with the reason for each intentional difference.
+- **Fuzzer** (`zig build fuzz`) has three targets:
+  - Generated and mutated messages, walked whole and in random chunks. The event streams must match, events must nest, and scratch must stay in bounds.
+  - Header parameter and encoded-word decoding into small buffers, plus unfold idempotence.
+  - Both transfer decoders under random splits.
+
+## Performance
+
+Apple M-series, ReleaseFast (`zig build bench`):
+
+| Benchmark | Throughput |
+|---|---|
+| Boundary candidate scan, base64 lines | 17.7 GiB/s |
+| base64 decode | 3.7 GiB/s |
+| quoted-printable decode (escape-dense) | 1.1 GiB/s |
+| Walk 16 MiB nested message with base64 attachments, decoding included, 64 KiB chunks | 3.0 GiB/s |
+| Same, 1500-byte chunks | 2.9 GiB/s |
+
+Memory is fixed: the walker struct is about 16 KiB, plus the scratch buffer you pass. The bench streams a 100 MiB nested message from a generator: RSS grows 80 KiB, and scratch use peaks at 167 bytes.
 
 ## Development
 
