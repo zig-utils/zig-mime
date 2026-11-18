@@ -726,3 +726,20 @@ test "a header block without its blank line ends at the first non-field line" {
         \\
     );
 }
+
+test "a CR held at a chunk boundary still pairs with the LF before a delimiter" {
+    // "a\ra" is a legal unquoted boundary here, so "--a\r" stays undecided until the LF.
+    try expectWalk("Content-Type: multipart/mixed; boundary=-; boundary=a\ra\n\n---\n\n--a\r\n---\n", .{},
+        \\begin 0: multipart multipart/mixed
+        \\diag conflicting_boundary 0:
+        \\diag boundary_invalid 0:
+        \\begin 1:1 leaf text/plain
+        \\body 1:1 content --a
+        \\end 1:1
+        \\begin 1:2 leaf text/plain
+        \\end 1:2
+        \\diag missing_close_delimiter 0:
+        \\end 0:
+        \\
+    );
+}

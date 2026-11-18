@@ -1033,7 +1033,13 @@ pub const Walker = struct {
                 self.head_len = 0;
                 self.at_line_start = false;
                 try self.flushEol();
-                try self.content(self.head[0..old]);
+                // A held CR may start the CRLF that precedes the next delimiter.
+                var held = old;
+                if (self.head[held - 1] == '\r') {
+                    held -= 1;
+                    self.cr_pending = true;
+                }
+                try self.content(self.head[0..held]);
                 return 0;
             },
             .delim => |d| {
