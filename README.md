@@ -17,6 +17,16 @@ Built for [Guardian](https://github.com/stacksjs/guardian)'s scanner and for the
 - header parsing with RFC 2047 and RFC 2231 decoding, plus ContentType and boundary validation
 - fuzz and differential tests
 
+## Development
+
+Zig `0.17.0-dev.1857+3c46da14d` (`pantry install` provides it from deps.yaml).
+
+```sh
+zig build test
+zig build fuzz -Dfuzz-iterations=100000
+zig build bench -- zig-out/bench.json
+```
+
 ## License
 
 MIT

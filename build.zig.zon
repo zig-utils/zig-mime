@@ -1,0 +1,23 @@
+.{
+    .name = .zig_mime,
+    .version = "0.0.0",
+    .fingerprint = 0x8aef63b33f27fe1d, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.1857",
+
+    // Registry tarballs with a hash, never relative paths.
+    .dependencies = .{
+        .bench = .{
+            .lazy = true,
+            .url = "https://registry.pantry.dev/zig/packages/zig-bench/0.2.1/tarball",
+            .hash = "zig_bench-0.2.1-FoCM--g7AwBKI7pKOE_UBYMOONDqfGQr-pR8nTpwf7vw",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

@@ -1,0 +1,11 @@
+{
+  "name": "zig-mime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Streaming MIME parser for Zig",
+  "scripts": {
+    "check:pin": "bun scripts/check-pin.ts",
+    "release": "pantry release patch --yes",
+    "release:minor": "pantry release minor --yes"
+  }
+}

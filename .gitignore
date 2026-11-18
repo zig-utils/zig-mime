@@ -1,0 +1,31 @@
+# Zig build output (both spellings)
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Prebuilt libraries are produced by the release workflow, never committed
+prebuilt/
+
+# Pantry and Bun
+pantry/
+.pantry/
+node_modules/
+pantry.lock
+
+# OS and editor files
+.DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+*~
+
+# Environment
+.env
+.env.local
+
+# Coverage and temporary files
+coverage/
+*.profdata
+*.tmp
+*.log
