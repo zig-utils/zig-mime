@@ -60,6 +60,14 @@ pub const Transcript = struct {
                 try self.out.appendSlice(w, "begin ");
                 try self.writePath(p);
                 try self.out.print(w, " {t} {s}/{s}", .{ p.kind, p.content_type.media_type, p.content_type.media_subtype });
+                if (p.filename) |f| {
+                    try self.out.appendSlice(w, " filename=");
+                    try self.escape(f);
+                }
+                if (p.name) |n| {
+                    try self.out.appendSlice(w, " name=");
+                    try self.escape(n);
+                }
                 try self.out.append(w, '\n');
             },
             .part_end => |e| {

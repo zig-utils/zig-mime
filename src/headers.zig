@@ -273,7 +273,99 @@ pub const ContentType = struct {
     }
 };
 
+/// The parameter called `name` (case-insensitive), first occurrence.
+pub fn findParam(params: []const u8, name: []const u8) ?Param {
+    var it: ParamIterator = .{ .rest = params };
+    while (it.next()) |p| {
+        if (std.ascii.eqlIgnoreCase(p.name, name)) return p;
+    }
+    return null;
+}
+
+/// Number of parameters called `name` (case-insensitive).
+pub fn countParam(params: []const u8, name: []const u8) usize {
+    var n: usize = 0;
+    var it: ParamIterator = .{ .rest = params };
+    while (it.next()) |p| {
+        if (std.ascii.eqlIgnoreCase(p.name, name)) n += 1;
+    }
+    return n;
+}
+
+/// A parsed Content-Disposition value.
+pub const Disposition = struct {
+    kind: Kind = .none,
+    /// The raw parameter list after the disposition type.
+    params: []const u8 = "",
+
+    pub const Kind = enum { none, @"inline", attachment, other };
+
+    pub fn parse(value: []const u8) Disposition {
+        const semi = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+        const t = trimWs(value[0..semi]);
+        const kind: Kind = if (std.ascii.eqlIgnoreCase(t, "inline"))
+            .@"inline"
+        else if (std.ascii.eqlIgnoreCase(t, "attachment"))
+            .attachment
+        else
+            .other;
+        return .{ .kind = kind, .params = value[semi..] };
+    }
+};
+
+/// The mail server's boundary limits (RFC 2046 section 5.1.1).
+pub const max_rfc_boundary_len = 70;
+
+pub const BoundaryError = error{ BoundaryTooLong, InvalidBoundary };
+
+/// The mail server's boundary validation: at most 70 characters, all from the RFC 2046 bchars
+/// set except space. The walker reports a failure as `boundary_invalid` and still splits on the
+/// boundary, because mail clients do.
+pub fn validateBoundary(boundary: []const u8) BoundaryError!void {
+    if (boundary.len > max_rfc_boundary_len) return error.BoundaryTooLong;
+    for (boundary) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or switch (c) {
+            '\'', '(', ')', '+', '_', ',', '-', '.', '/', ':', '=', '?' => true,
+            else => false,
+        };
+        if (!ok) return error.InvalidBoundary;
+    }
+}
+
 const testing = std.testing;
+
+// Ported from the mail server (packages/zig/src/message/mime.zig, "parse content type").
+test "mail port: parse content type" {
+    const ct = try ContentType.parse("multipart/mixed; boundary=\"----=_Part_123\"; charset=utf-8");
+    try testing.expectEqualStrings("multipart", ct.media_type);
+    try testing.expectEqualStrings("mixed", ct.media_subtype);
+    try testing.expectEqualStrings("----=_Part_123", ct.boundary.?);
+    try testing.expectEqualStrings("utf-8", ct.charset.?);
+    try testing.expect(ct.isMultipart());
+}
+
+test "mail port: a type without a slash is invalid" {
+    try testing.expectError(error.InvalidContentType, ContentType.parse("text"));
+    try testing.expectError(error.InvalidContentType, ContentType.parse(""));
+}
+
+// Ported from the mail server's MultipartParser tests and tests/security_test.zig.
+test "mail port: boundary validation" {
+    try testing.expectError(error.BoundaryTooLong, validateBoundary(&@as([71]u8, @splat('a'))));
+    try testing.expectError(error.BoundaryTooLong, validateBoundary(&@as([1000]u8, @splat('a'))));
+    try testing.expectError(error.InvalidBoundary, validateBoundary("test boundary"));
+    try validateBoundary(&@as([70]u8, @splat('a')));
+    try validateBoundary("----=_Part_123");
+    try validateBoundary("'()+_,-./:=?09azAZ");
+}
+
+test "Content-Disposition" {
+    const d = Disposition.parse("Attachment; filename=\"a.txt\"");
+    try testing.expectEqual(Disposition.Kind.attachment, d.kind);
+    try testing.expectEqualStrings("a.txt", findParam(d.params, "FILENAME").?.value);
+    try testing.expectEqual(Disposition.Kind.@"inline", Disposition.parse("inline").kind);
+    try testing.expectEqual(@as(usize, 2), countParam("; a=1; A=\"2\"; b=3", "a"));
+}
 
 test "unfold joins continuation lines and normalises line endings" {
     var raw = "Subject: a long\r\n  subject\r\nX-Bare: lf\nFrom : x@y\r\n\tcontinued\r\n".*;

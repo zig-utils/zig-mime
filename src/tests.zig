@@ -547,3 +547,62 @@ test "an encoded multipart is delivered decoded, an unknown encoding as is" {
         \\
     );
 }
+
+test "filenames are decoded from RFC 2231 sections and RFC 2047 words" {
+    try expectWalk(crlf(
+        \\Content-Type: multipart/mixed; boundary="a b\"c"
+        \\
+        \\--a b"c
+        \\Content-Type: application/pdf; name="=?UTF-8?B?Y2Fmw6kucGRm?="
+        \\Content-Disposition: attachment;
+        \\ filename*0*=utf-8''caf%C3%A9%20;
+        \\ filename*1="report.pdf"
+        \\
+        \\%PDF
+        \\--a b"c--
+    ), .{},
+        \\begin 0: multipart multipart/mixed
+        \\diag boundary_invalid 0:
+        \\begin 1:1 leaf application/pdf filename=caf\xc3\xa9 report.pdf name=caf\xc3\xa9.pdf
+        \\body 1:1 content %PDF
+        \\end 1:1
+        \\end 0:
+        \\
+    );
+}
+
+test "a decoded filename that does not fit in scratch is reported" {
+    try expectWalk(crlf(
+        \\Content-Disposition: attachment; filename="0123456789abcdef.exe"
+        \\
+        \\x
+    ), .{ .scratch_len = 70 },
+        \\begin 0: leaf text/plain filename=01234
+        \\diag parameter_truncated 0:
+        \\body 0: content x
+        \\end 0:
+        \\
+    );
+}
+
+test "Part exposes charset, disposition and encoding" {
+    const Probe = struct {
+        seen: bool = false,
+        pub fn onEvent(self: *@This(), event: mime.Event) mime.Sink.Error!void {
+            if (event != .part_begin) return;
+            const p = event.part_begin;
+            testing.expectEqualStrings("iso-8859-1", p.charset.?) catch return error.Aborted;
+            testing.expectEqual(mime.Disposition.Kind.@"inline", p.disposition) catch return error.Aborted;
+            testing.expectEqual(mime.Encoding.quoted_printable, p.encoding) catch return error.Aborted;
+            testing.expectEqualStrings("Hello", p.headers.get("subject").?) catch return error.Aborted;
+            self.seen = true;
+        }
+    };
+    var probe: Probe = .{};
+    var scratch: [512]u8 = undefined;
+    var w = Walker.init(&scratch, mime.Sink.init(&probe), .{});
+    try w.feed("Subject: Hello\r\nContent-Type: text/plain; charset=\"iso-8859-1\"\r\n" ++
+        "Content-Disposition: inline\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nx");
+    try w.finish();
+    try testing.expect(probe.seen);
+}

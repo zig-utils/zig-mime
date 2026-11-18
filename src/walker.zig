@@ -15,6 +15,7 @@ const std = @import("std");
 const headers = @import("headers.zig");
 const scan = @import("scan.zig");
 const decode = @import("decode.zig");
+const text = @import("text.zig");
 
 const Headers = headers.Headers;
 const ContentType = headers.ContentType;
@@ -68,6 +69,14 @@ pub const Part = struct {
     boundary: ?[]const u8 = null,
     /// Content-Transfer-Encoding. A leaf's `body` events carry decoded bytes.
     encoding: decode.Encoding = .none,
+    /// The Content-Type charset parameter, as written.
+    charset: ?[]const u8 = null,
+    disposition: headers.Disposition.Kind = .none,
+    /// Content-Disposition filename, decoded to UTF-8 (RFC 2231 sections and charsets first,
+    /// then RFC 2047 encoded words in a plain value).
+    filename: ?[]const u8 = null,
+    /// Content-Type name parameter, decoded the same way.
+    name: ?[]const u8 = null,
 };
 
 pub const Region = enum {
@@ -115,6 +124,12 @@ pub const DiagnosticKind = enum {
     multipart_without_boundary,
     /// A boundary is longer than `max_boundary_len`; the multipart was delivered as a leaf.
     boundary_too_long,
+    /// A boundary fails the mail server's RFC 2046 validation (over 70 characters or outside
+    /// the bchars set). The walker still splits on it, as mail clients do.
+    boundary_invalid,
+    /// A decoded filename or name parameter did not fit (scratch or the 2 KiB parameter cap)
+    /// and was cut short.
+    parameter_truncated,
     /// A delimiter line continues past the boundary with something other than "--" and
     /// whitespace. It still counts as a delimiter, as in mail clients that match the prefix.
     boundary_suffix,
@@ -168,6 +183,18 @@ pub const Sink = struct {
             }
         };
         return .{ .context = pointer, .onEventFn = gen.call };
+    }
+};
+
+/// Diagnostics found while parsing a header block, emitted right after its part_begin.
+const Pending = struct {
+    kinds: [8]DiagnosticKind = undefined,
+    len: usize = 0,
+
+    fn add(self: *Pending, kind: DiagnosticKind) void {
+        if (self.len == self.kinds.len) return;
+        self.kinds[self.len] = kind;
+        self.len += 1;
     }
 };
 
@@ -536,8 +563,7 @@ pub const Walker = struct {
         self.scratch_top = self.hdr_start + block.len;
         e.part.headers = .{ .block = block };
 
-        var pending: [6]DiagnosticKind = undefined;
-        var npending: usize = 0;
+        var pending: Pending = .{};
 
         const in_digest = self.len >= 2 and self.stack[self.len - 2].part.kind == .multipart and
             self.stack[self.len - 2].part.content_type.is("multipart", "digest");
@@ -545,55 +571,50 @@ pub const Walker = struct {
         if (e.part.headers.get("content-type")) |value| {
             if (ContentType.parse(value)) |parsed| {
                 ct = parsed;
-            } else |_| {
-                pending[npending] = .invalid_content_type;
-                npending += 1;
-            }
+            } else |_| pending.add(.invalid_content_type);
         }
         e.part.content_type = ct;
+        e.part.charset = ct.charset;
 
         var kind: Kind = .leaf;
         if (ct.isMultipart()) {
-            e.part.boundary = ct.boundary;
-            if (ct.boundary == null or ct.boundary.?.len == 0) {
-                pending[npending] = .multipart_without_boundary;
-                npending += 1;
-            } else if (ct.boundary.?.len > max_boundary_len) {
-                pending[npending] = .boundary_too_long;
-                npending += 1;
-            } else if (e.part.depth + 1 > self.options.max_depth) {
-                pending[npending] = .depth_exceeded;
-                npending += 1;
+            e.part.boundary = self.boundaryOf(ct);
+            const b = e.part.boundary orelse "";
+            if (b.len == 0) {
+                pending.add(.multipart_without_boundary);
+            } else if (b.len > max_boundary_len) {
+                pending.add(.boundary_too_long);
             } else {
-                kind = .multipart;
+                headers.validateBoundary(b) catch pending.add(.boundary_invalid);
+                if (e.part.depth + 1 > self.options.max_depth) pending.add(.depth_exceeded) else kind = .multipart;
             }
         } else if (ct.isEmbeddedMessage()) {
-            if (e.part.depth + 1 > self.options.max_depth) {
-                pending[npending] = .depth_exceeded;
-                npending += 1;
-            } else {
-                kind = .message;
-            }
+            if (e.part.depth + 1 > self.options.max_depth) pending.add(.depth_exceeded) else kind = .message;
         }
         var encoding: decode.Encoding = .none;
         if (e.part.headers.get("content-transfer-encoding")) |value| {
             encoding = decode.Encoding.parse(value);
-            if (encoding == .unknown) {
-                pending[npending] = .unknown_transfer_encoding;
-                npending += 1;
-            }
+            if (encoding == .unknown) pending.add(.unknown_transfer_encoding);
         }
         if (kind != .leaf and !encoding.isIdentity()) {
-            pending[npending] = .encoded_container;
-            npending += 1;
+            pending.add(.encoded_container);
             kind = .leaf;
         }
         e.part.encoding = encoding;
         e.part.kind = kind;
         if (kind == .leaf) e.decoder = .init(encoding);
 
+        var disposition_params: []const u8 = "";
+        if (e.part.headers.get("content-disposition")) |value| {
+            const d = headers.Disposition.parse(value);
+            e.part.disposition = d.kind;
+            disposition_params = d.params;
+        }
+        e.part.filename = self.decodeParam(disposition_params, "filename", &pending);
+        e.part.name = self.decodeParam(ct.params, "name", &pending);
+
         try self.emit(.{ .part_begin = &e.part });
-        for (pending[0..npending]) |k| try self.diag(k, &e.part);
+        for (pending.kinds[0..pending.len]) |k| try self.diag(k, &e.part);
 
         switch (kind) {
             .multipart => {
@@ -606,6 +627,30 @@ pub const Walker = struct {
             },
             .leaf => self.enterBody(),
         }
+    }
+
+    /// The boundary parameter with quoted-string escapes removed (into scratch when it has any).
+    fn boundaryOf(self: *Walker, ct: ContentType) ?[]const u8 {
+        const p = headers.findParam(ct.params, "boundary") orelse return null;
+        if (!p.quoted or std.mem.indexOfScalar(u8, p.value, '\\') == null) return p.value;
+        const room = self.scratch[self.scratch_top..];
+        if (room.len < p.value.len) return p.value;
+        const b = headers.unquote(p.value, room);
+        self.bump(b.len);
+        return b;
+    }
+
+    /// Decodes a filename-like parameter (RFC 2231, RFC 2047) into scratch.
+    fn decodeParam(self: *Walker, params: []const u8, name: []const u8, pending: *Pending) ?[]const u8 {
+        const r = text.decodeParam(params, name, self.scratch[self.scratch_top..]) orelse return null;
+        self.bump(r.text.len);
+        if (r.flags.truncated) pending.add(.parameter_truncated);
+        return r.text;
+    }
+
+    fn bump(self: *Walker, n: usize) void {
+        self.scratch_top += n;
+        self.notePeak(self.scratch_top);
     }
 
     // Delimiters
