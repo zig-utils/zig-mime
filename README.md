@@ -11,7 +11,7 @@ Built for [Guardian](https://github.com/stacksjs/guardian)'s scanner and for the
 ## Installation
 
 ```sh
-zig fetch --save https://registry.pantry.dev/zig/packages/zig-mime/0.1.0/tarball
+zig fetch --save https://registry.pantry.dev/zig/packages/zig-mime/0.1.1/tarball
 ```
 
 ```zig
