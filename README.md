@@ -112,7 +112,7 @@ Lines ending in a bare CR (old Mac OS) are not treated as line breaks.
 
 ## Performance
 
-Apple M-series, ReleaseFast (`zig build bench`):
+Apple M-series, ReleaseFast (`zig build bench -Dbench`):
 
 | Benchmark | Throughput |
 |---|---|
@@ -131,8 +131,10 @@ Zig `0.17.0-dev.1857+3c46da14d` (`pantry install` provides it from deps.yaml).
 ```sh
 zig build test
 zig build fuzz -Dfuzz-iterations=100000
-zig build bench -- zig-out/bench.json
+zig build bench -Dbench -- zig-out/bench.json
 ```
+
+`-Dbench` fetches zig-bench. It is off by default, so a project that depends on zig-mime never downloads it.
 
 ## License
 

@@ -53,8 +53,13 @@ pub fn build(b: *std.Build) void {
     run_fuzz.addArgs(&.{ b.fmt("{d}", .{fuzz_iterations}), b.fmt("{d}", .{fuzz_seed}), b.fmt("{d}", .{fuzz_seconds}) });
     b.step("fuzz", "Run deterministic fuzz cases").dependOn(&run_fuzz.step);
 
-    const bench_step = b.step("bench", "Run benchmarks and write a JSON result file");
-    if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {
+    // zig-bench is lazy, but a lazy dependency is fetched whenever this script asks for it, and this
+    // script also runs inside every project that depends on zig-mime. So it asks only under -Dbench.
+    const bench_step = b.step("bench", "Run benchmarks and write a JSON result file (needs -Dbench)");
+    const bench = b.option(bool, "bench", "Fetch zig-bench and build the bench step") orelse false;
+    if (!bench) {
+        bench_step.dependOn(&b.addFail("the bench step needs -Dbench, which fetches zig-bench").step);
+    } else if (b.lazyDependency("bench", .{ .target = target, .optimize = .fast })) |bench_dep| {
         const bench_exe = b.addExecutable(.{
             .name = "bench",
             .root_module = b.createModule(.{
