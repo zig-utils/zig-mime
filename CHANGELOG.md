@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.1 - 2026-11-24
+
+- chore: prepare the 0.1.1 release (9d14592)
+- fix(build): fetch zig-bench only under -Dbench (c07c1c6)
+
 ## v0.1.0 - 2026-11-17
 
 - chore: prepare the 0.1.0 release (c1e5348)
